@@ -1,0 +1,323 @@
+"""
+CAMISA BARATA — scraper v1
+============================================================
+Cobre as 3 lojas combinadas: New Balance (São Paulo), Nike
+(Corinthians) e Puma (Palmeiras). Sempre camisas masculinas,
+números 1 e 2 (casa/fora), separando jogador de torcedor.
+
+IMPORTANTE — leia antes de rodar:
+  A maioria das lojas (New Balance, Adidas e, pelo visto, também
+  a Puma) manda o preço pronto no HTML da página, então um
+  `requests.get` simples já pega. Só a Nike parece depender de
+  JavaScript pra mostrar o preço quando o produto está em
+  estoque.
+
+  Por isso o script tenta sempre o método simples primeiro
+  (`requests`) pra qualquer loja, e só usa um navegador headless
+  (Playwright) como último recurso, se o preço simples não vier.
+  Isso significa que, pra rodar só com as URLs já confirmadas,
+  você só precisa de:
+    pip install requests supabase --break-system-packages
+
+  Se algum produto precisar mesmo do navegador, o script avisa
+  no terminal — aí sim instala também:
+    pip install playwright --break-system-packages
+    playwright install chromium
+
+============================================================
+"""
+
+import re
+import os
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+from supabase import create_client
+
+# ------------------------------------------------------------
+# CONFIG — credenciais do Supabase
+# ------------------------------------------------------------
+# Pegue essas duas informações em: Supabase > Project Settings > API
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "COLOQUE_AQUI")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "COLOQUE_AQUI")  # use a "service_role" key (privada, nunca no frontend)
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ------------------------------------------------------------
+# CONFIG — produtos monitorados
+# ------------------------------------------------------------
+# store: "new_balance" | "nike" | "puma"  -> define qual método de scraping usar
+# kit_type: "home" (I) ou "away" (II)
+# fit_type: "torcedor" ou "autentica" (jogador)
+#
+# PREENCHA os campos marcados com None — são os que eu não
+# consegui confirmar a URL exata (o site muda o link toda
+# temporada). É só abrir o produto no site, copiar o link e
+# colar aqui.
+PRODUCTS = [
+    # ---------------- SÃO PAULO — NEW BALANCE ----------------
+    {
+        "team": "Sao Paulo", "team_short": "SAO", "store": "new_balance",
+        "kit_type": "home", "fit_type": "torcedor",
+        "name": "São Paulo I 2026 Torcedor",
+        "url": "https://www.newbalance.com.br/camisa-home-torcedor-spfc-2026-masculina-1374286/p",
+    },
+    {
+        "team": "Sao Paulo", "team_short": "SAO", "store": "new_balance",
+        "kit_type": "home", "fit_type": "autentica",
+        "name": "São Paulo I 2026 Jogador",
+        "url": None,  # ainda não achei o link certo dessa versão específica
+    },
+    {
+        "team": "Sao Paulo", "team_short": "SAO", "store": "new_balance",
+        "kit_type": "away", "fit_type": "torcedor",
+        "name": "São Paulo II 2026 Torcedor",
+        "url": "https://www.newbalance.com.br/camisa-away-torcedor-spfc-2026-masculina-1380022/p",
+    },
+    {
+        "team": "Sao Paulo", "team_short": "SAO", "store": "new_balance",
+        "kit_type": "away", "fit_type": "autentica",
+        "name": "São Paulo II 2026 Jogador",
+        "url": "https://www.newbalance.com.br/camisa-away-jogador-spfc-2026-masculina-1345985/p",
+    },
+
+    # ---------------- CORINTHIANS — NIKE ----------------
+    {
+        "team": "Corinthians", "team_short": "COR", "store": "nike",
+        "kit_type": "home", "fit_type": "torcedor",
+        "name": "Corinthians I 2026/27 Torcedor",
+        "url": "https://www.nike.com.br/camisa-corinthians-nike-i-2026-27-torcedor-pro-masculina-107000.html",
+    },
+    {
+        "team": "Corinthians", "team_short": "COR", "store": "nike",
+        "kit_type": "home", "fit_type": "autentica",
+        "name": "Corinthians I 2026/27 Jogador",
+        "url": "https://www.nike.com.br/camisa-corinthians-nike-i-2026-27-jogador-masculina-098390.html",
+    },
+    {
+        "team": "Corinthians", "team_short": "COR", "store": "nike",
+        "kit_type": "away", "fit_type": "torcedor",
+        "name": "Corinthians II 2026/27 Torcedor",
+        "url": None,  # preencha com o link da camisa II Torcedor
+    },
+    {
+        "team": "Corinthians", "team_short": "COR", "store": "nike",
+        "kit_type": "away", "fit_type": "autentica",
+        "name": "Corinthians II 2026/27 Jogador",
+        "url": None,  # preencha com o link da camisa II Jogador
+    },
+
+    # ---------------- PALMEIRAS — PUMA ----------------
+    {
+        "team": "Palmeiras", "team_short": "PAL", "store": "puma",
+        "kit_type": "home", "fit_type": "autentica",
+        "name": "Palmeiras I 2026 Jogador",
+        "url": "https://br.puma.com/pd/camisa-palmeiras-home-2026-jogador-masculina/787208.html",
+    },
+    {
+        "team": "Palmeiras", "team_short": "PAL", "store": "puma",
+        "kit_type": "home", "fit_type": "torcedor",
+        "name": "Palmeiras I 2026 Torcedor",
+        "url": None,  # preencha com o link da versão Torcedor (não Jogador) Home
+    },
+    {
+        "team": "Palmeiras", "team_short": "PAL", "store": "puma",
+        "kit_type": "away", "fit_type": "autentica",
+        "name": "Palmeiras II 2026 Jogador",
+        "url": "https://br.puma.com/pd/camisa-palmeiras-away-2026-jogador-masculina/787249.html",
+    },
+    {
+        "team": "Palmeiras", "team_short": "PAL", "store": "puma",
+        "kit_type": "away", "fit_type": "torcedor",
+        "name": "Palmeiras II 2026 Torcedor",
+        "url": None,  # preencha com o link da versão Torcedor Away
+    },
+
+    # ---------------- FLAMENGO — ADIDAS (teste de uma 4ª loja) ----------------
+    {
+        "team": "Flamengo", "team_short": "FLA", "store": "adidas",
+        "kit_type": "home", "fit_type": "torcedor",
+        "name": "Flamengo I 25/26 Torcedor",
+        "url": "https://www.adidas.com.br/camisa-i-flamengo-25-26/IV6052.html",
+    },
+    {
+        "team": "Flamengo", "team_short": "FLA", "store": "adidas",
+        "kit_type": "home", "fit_type": "autentica",
+        "name": "Flamengo I 25/26 Jogador",
+        "url": "https://www.adidas.com.br/camisa-i-flamengo-authentic-25-26/IV6047.html",
+    },
+    {
+        "team": "Flamengo", "team_short": "FLA", "store": "adidas",
+        "kit_type": "away", "fit_type": "torcedor",
+        "name": "Flamengo II 25/26 Torcedor",
+        "url": None,  # preencha com o link da versão Away Torcedor
+    },
+    {
+        "team": "Flamengo", "team_short": "FLA", "store": "adidas",
+        "kit_type": "away", "fit_type": "autentica",
+        "name": "Flamengo II 25/26 Jogador",
+        "url": None,  # preencha com o link da versão Away Jogador
+    },
+]
+
+# cabeçalhos que imitam melhor um navegador de verdade, ajuda a passar
+# por proteções simples contra robôs (ex: Adidas)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+# regex pra achar "R$ 249,99" em qualquer texto e converter pra 249.99
+PRICE_PATTERN = re.compile(r"R\$\s?([\d\.]+,\d{2})")
+
+
+def parse_price(text: str) -> Optional[float]:
+    match = PRICE_PATTERN.search(text)
+    if not match:
+        return None
+    raw = match.group(1).replace(".", "").replace(",", ".")
+    return float(raw)
+
+
+# ------------------------------------------------------------
+# MÉTODO 1 — New Balance (VTEX): preço vem direto no HTML
+# ------------------------------------------------------------
+def scrape_new_balance(url: str) -> Optional[float]:
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    match = re.search(r'product:price:amount"\s*content="([\d.]+)"', resp.text)
+    if match:
+        return float(match.group(1))
+    # fallback: procura o padrão "R$ ###,##" no HTML bruto
+    return parse_price(resp.text)
+
+
+# ------------------------------------------------------------
+# MÉTODO 1b — Adidas: também vem direto no HTML, mas com um
+# rótulo diferente ("PreçoR$399,99" em vez de meta tag)
+# ------------------------------------------------------------
+def scrape_adidas(url: str) -> Optional[float]:
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    match = re.search(r"Pre[çc]o\s*R\$\s?([\d\.]+,\d{2})", resp.text)
+    if match:
+        return float(match.group(1).replace(".", "").replace(",", "."))
+    return parse_price(resp.text)
+
+
+# ------------------------------------------------------------
+# MÉTODO 2 — último recurso: navegador headless (Playwright),
+# só entra em ação se o método simples não achar preço nenhum
+# ------------------------------------------------------------
+def scrape_with_browser(url: str) -> Optional[float]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  [aviso] esse produto precisaria do Playwright, que não está instalado.")
+        print("          rode: pip install playwright --break-system-packages && playwright install chromium")
+        return None
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(user_agent="Mozilla/5.0")
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        page.wait_for_timeout(1500)  # dá um respiro pro React terminar de montar o preço
+        body_text = page.inner_text("body")
+        browser.close()
+    return parse_price(body_text)
+
+
+def scrape_price(product: dict) -> Optional[float]:
+    if product["url"] is None:
+        print(f"  [pulado] {product['name']} — falta preencher a URL")
+        return None
+
+    url = product["url"]
+    # tenta sempre o caminho simples primeiro, pra qualquer loja
+    if product["store"] == "new_balance":
+        price = scrape_new_balance(url)
+    elif product["store"] == "adidas":
+        price = scrape_adidas(url)
+    else:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        price = parse_price(resp.text)
+
+    if price is not None:
+        return price
+
+    # só recorre ao navegador se o caminho simples não achou nada
+    print("  [info] preço não veio no HTML simples, tentando navegador headless...")
+    return scrape_with_browser(url)
+
+
+# ------------------------------------------------------------
+# GRAVA NO SUPABASE
+# ------------------------------------------------------------
+def upsert_and_record_price(product: dict, price: float):
+    team = supabase.table("teams").select("id").eq("name", product["team"]).execute().data
+    if not team:
+        team_id = supabase.table("teams").insert({
+            "name": product["team"], "short_name": product["team_short"],
+            "slug": product["team"].lower().replace(" ", "-"),
+        }).execute().data[0]["id"]
+    else:
+        team_id = team[0]["id"]
+
+    brand = supabase.table("brands").select("id").eq("name", product["store"]).execute().data
+    if not brand:
+        brand_id = supabase.table("brands").insert({"name": product["store"]}).execute().data[0]["id"]
+    else:
+        brand_id = brand[0]["id"]
+
+    store = supabase.table("stores").select("id").eq("slug", product["store"]).execute().data
+    if not store:
+        store_id = supabase.table("stores").insert({
+            "name": product["store"], "slug": product["store"], "base_url": product["url"],
+        }).execute().data[0]["id"]
+    else:
+        store_id = store[0]["id"]
+
+    jersey = supabase.table("jerseys").select("id").eq("slug", product["name"].lower().replace(" ", "-")).execute().data
+    if not jersey:
+        jersey_id = supabase.table("jerseys").insert({
+            "team_id": team_id, "brand_id": brand_id, "season": "2026",
+            "kit_type": product["kit_type"], "fit_type": product["fit_type"],
+            "name": product["name"], "slug": product["name"].lower().replace(" ", "-"),
+        }).execute().data[0]["id"]
+    else:
+        jersey_id = jersey[0]["id"]
+
+    listing = supabase.table("listings").select("id").eq("jersey_id", jersey_id).eq("store_id", store_id).execute().data
+    if not listing:
+        listing_id = supabase.table("listings").insert({
+            "jersey_id": jersey_id, "store_id": store_id, "product_url": product["url"],
+        }).execute().data[0]["id"]
+    else:
+        listing_id = listing[0]["id"]
+
+    supabase.table("price_history").insert({
+        "listing_id": listing_id, "price": price,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+    supabase.table("listings").update({
+        "last_checked": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", listing_id).execute()
+
+
+# ------------------------------------------------------------
+# RODA TUDO
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    for product in PRODUCTS:
+        print(f"Verificando: {product['name']} ({product['store']})...")
+        try:
+            price = scrape_price(product)
+            if price is None:
+                continue
+            print(f"  -> R$ {price:.2f}")
+            upsert_and_record_price(product, price)
+        except Exception as e:
+            print(f"  [erro] {product['name']}: {e}")
